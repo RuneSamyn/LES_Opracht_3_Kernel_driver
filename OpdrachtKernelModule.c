@@ -5,6 +5,24 @@
 #include <linux/timer.h>
 #include <linux/init.h>
 #include <linux/interrupt.h> 
+#include <linux/version.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/errno.h>
+#include <asm/uaccess.h>
+#include <linux/uaccess.h> 
+
+#include "OpdrachtKernelModule.h"
+
+#define FIRST_MINOR 0
+#define MINOR_CNT 1
+ 
+static dev_t dev;
+static struct cdev c_dev;
+static struct class *cl;
+static struct gpio outputs[2];
+static struct gpio input;
 
 static int          toggleSpeed	= 1000;
 static int 			outputPins[2] = { -1, -1 };
@@ -14,11 +32,6 @@ static struct       timer_list toggle_timer;
 static long         outputState=1;
 static int          input_irq = -1;
 static long         input_edge_counter = 0;
-/*
- * Struct defining pins, direction and inital state 
- */
-static struct gpio outputs[2];
-static struct gpio input;
 
 module_param(toggleSpeed, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(toggleSpeed, "toggle speed of output pins in sec");
@@ -32,8 +45,8 @@ static void toggle_timer_func(struct timer_list* t)
 {
     gpio_set_value(outputs[0].gpio, outputState);
     gpio_set_value(outputs[1].gpio, outputState);
-	printk(KERN_INFO "edge counter = %ld\n", input_edge_counter);
 	outputState=!outputState;
+	printk(KERN_INFO "number of input edges: %ld \n", input_edge_counter);
 	/* schedule next execution */
 	toggle_timer.expires = jiffies + (toggleSpeed * HZ); 		// 1 sec.
 	add_timer(&toggle_timer);
@@ -48,6 +61,97 @@ static irqreturn_t input_isr(int irq, void *data)
 		input_edge_counter++;
 	}
 	return IRQ_HANDLED;
+}
+
+static int my_open(struct inode *i, struct file *f)
+{
+    return 0;
+}
+static int my_close(struct inode *i, struct file *f)
+{
+    return 0;
+}
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35))
+static int my_ioctl(struct inode *i, struct file *f, unsigned int cmd, unsigned long arg)
+#else
+static long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+#endif
+{
+    query_arg_t q;
+ 
+    switch (cmd)
+    {
+        case GET_EDGES:
+            q.edges = input_edge_counter;
+            if (copy_to_user((query_arg_t *)arg, &q, sizeof(query_arg_t)))
+            {
+                return -EACCES;
+            }
+            break;
+        case CLEAR_EDGES:
+            input_edge_counter = 0;
+            break;
+        case SET_TOGGLE_SPEED:
+            if (copy_from_user(&q, (query_arg_t *)arg, sizeof(query_arg_t)))
+            {
+                return -EACCES;
+            }
+            toggleSpeed = q.toggleSpeed;
+            break;
+        default:
+            return -EINVAL;
+    }
+ 
+    return 0;
+}
+ 
+static struct file_operations opdrachtKM_fops =
+{
+    .owner = THIS_MODULE,
+    .open = my_open,
+    .release = my_close,
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35))
+    .ioctl = my_ioctl
+#else
+    .unlocked_ioctl = my_ioctl
+#endif
+};
+
+static int ioctl_init(void)
+{
+	
+    int ret;
+    struct device *dev_ret;
+ 
+ 
+    if ((ret = alloc_chrdev_region(&dev, FIRST_MINOR, MINOR_CNT, "opdrachtKM_ioctl")) < 0)
+    {
+        return ret;
+    }
+ 
+    cdev_init(&c_dev, &opdrachtKM_fops);
+ 
+    if ((ret = cdev_add(&c_dev, dev, MINOR_CNT)) < 0)
+    {
+        return ret;
+    }
+     
+    if (IS_ERR(cl = class_create(THIS_MODULE, "char")))
+    {
+        cdev_del(&c_dev);
+        unregister_chrdev_region(dev, MINOR_CNT);
+        return PTR_ERR(cl);
+    }
+    if (IS_ERR(dev_ret = device_create(cl, NULL, dev, NULL, "opdrachtKM")))
+    {
+        class_destroy(cl);
+        cdev_del(&c_dev);
+        unregister_chrdev_region(dev, MINOR_CNT);
+        return PTR_ERR(dev_ret);
+    }
+ 
+    return 0;
 }
 
 /*
@@ -78,7 +182,7 @@ static int __init opdrachtKM_init(void)
 	if(ret) {
 		printk(KERN_ERR "Unable to request GPIOs for OUTPUTs: %d\n", ret);
 	}
-	
+
 	// register INPUT gpio
 	ret = gpio_request(input.gpio, "Input pin");
 	if (ret) {
@@ -102,6 +206,12 @@ static int __init opdrachtKM_init(void)
 	toggle_timer.function = toggle_timer_func;
 	toggle_timer.expires = jiffies + (toggleSpeed * HZ); 		// 1 sec.
 	add_timer(&toggle_timer);
+
+	// init ioctl
+	ret = ioctl_init();
+	if(ret) {
+		printk(KERN_ERR "Error init ioctl %d\n", ret);
+	}
 
 	return ret;
 }
@@ -130,6 +240,12 @@ static void __exit opdrachtKM_exit(void)
 	
 	// unregister all GPIOs
 	gpio_free_array(outputs, ARRAY_SIZE(outputs));
+
+	// destroy ioctl
+    device_destroy(cl, dev);
+    class_destroy(cl);
+    cdev_del(&c_dev);
+    unregister_chrdev_region(dev, MINOR_CNT);
 }
 
 MODULE_LICENSE("GPL");
