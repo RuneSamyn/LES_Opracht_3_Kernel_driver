@@ -4,6 +4,7 @@
 #include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/init.h>
+#include <linux/interrupt.h> 
 
 static int          toggleSpeed	= 1000;
 static int 			outputPins[2] = { -1, -1 };
@@ -11,10 +12,13 @@ static int          inputPin = -1;
 static int 			arr_argc = 0;
 static struct       timer_list toggle_timer;
 static long         outputState=1;
+static int          input_irq = -1;
+static long         input_edge_counter = 0;
 /*
  * Struct defining pins, direction and inital state 
  */
 static struct gpio outputs[2];
+static struct gpio input;
 
 module_param(toggleSpeed, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(toggleSpeed, "toggle speed of output pins in sec");
@@ -26,15 +30,24 @@ MODULE_PARM_DESC(outputPins, "2 output gpio pins");
 
 static void toggle_timer_func(struct timer_list* t)
 {
-    int i;
-	for (i = 0; i < (sizeof outputs / sizeof (int)); i++)
-	{
-        gpio_set_value(outputs[i].gpio, outputState);
-	}
+    gpio_set_value(outputs[0].gpio, outputState);
+    gpio_set_value(outputs[1].gpio, outputState);
+	printk(KERN_INFO "edge counter = %ld\n", input_edge_counter);
 	outputState=!outputState;
 	/* schedule next execution */
 	toggle_timer.expires = jiffies + (toggleSpeed * HZ); 		// 1 sec.
 	add_timer(&toggle_timer);
+}
+
+/*
+ * The interrupt service routine called on button presses
+ */
+static irqreturn_t input_isr(int irq, void *data)
+{
+	if(irq == input_irq){
+		input_edge_counter++;
+	}
+	return IRQ_HANDLED;
 }
 
 /*
@@ -56,10 +69,33 @@ static int __init opdrachtKM_init(void)
         }
 		printk(KERN_INFO "Output pin %d = %d\n", i + 1, outputPins[i]);
 	}
-	// register LED gpios, turn gpios on
+    if(inputPin > 0) {
+		struct gpio g = {inputPin, GPIOF_IN, "Input pin"};
+        input = g;
+    }
+	// register outputs
 	ret = gpio_request_array(outputs, ARRAY_SIZE(outputs));
+	if(ret) {
+		printk(KERN_ERR "Unable to request GPIOs for OUTPUTs: %d\n", ret);
+	}
+	
+	// register INPUT gpio
+	ret = gpio_request(input.gpio, "Input pin");
 	if (ret) {
-		printk(KERN_ERR "Unable to request GPIOs: %d\n", ret);
+		printk(KERN_ERR "Unable to request GPIOs for INPUT: %d\n", ret);
+	}
+	ret = gpio_to_irq(input.gpio);
+	if(ret < 0) {
+		printk(KERN_ERR "Unable to request IRQ: %d\n", ret);
+	}
+	input_irq = ret;
+	printk(KERN_INFO "Successfully requested INPUT IRQ # %d\n", input_irq);
+	
+	ret = request_irq(input_irq, input_isr, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING /*| IRQF_DISABLED*/, "gpiomod#input", NULL);
+
+	printk(KERN_INFO "after IRQ request\n");
+	if(ret) {
+		printk(KERN_ERR "Unable to request IRQ: %d\n", ret);
 	}
 	/* init timer, add timer function */
 	timer_setup(&toggle_timer, toggle_timer_func, 0);
@@ -76,15 +112,21 @@ static int __init opdrachtKM_init(void)
 static void __exit opdrachtKM_exit(void)
 {
 	printk(KERN_INFO "%s\n", __func__);
-    
+	
+	// free irqs
+	free_irq(input_irq, NULL);
+
+	printk(KERN_INFO "after free_irq");
+
 	// deactivate timer if running
 	del_timer_sync(&toggle_timer);
 
-	// turn all LEDs off
-    int i;
+	// turn all GPIOs off
+	int i = 0;
 	for(i = 0; i < ARRAY_SIZE(outputs); i++) {
 		gpio_set_value(outputs[i].gpio, 0); 
 	}
+	printk(KERN_INFO "after turn gpio off");
 	
 	// unregister all GPIOs
 	gpio_free_array(outputs, ARRAY_SIZE(outputs));
